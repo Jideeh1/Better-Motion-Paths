@@ -1,5 +1,8 @@
 # Better-Motion-Paths
 A blender add-on that allows motion path adjustment inside the 3D viewport.
+<p align="center">
+  <img src="Better Motion Paths.png">
+</p>
 
 This add-on adds a **Motion Path** panel to Blender's 3D View sidebar.
 `3D Viewport > Sidebar/N Panel > Motion Path`
