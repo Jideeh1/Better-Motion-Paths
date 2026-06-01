@@ -39,6 +39,11 @@ This lets you create a visible Bezier curve from an object's motion path that is
 | `Recalculate Motion Path` | Button | Manually recalculates the selected object's or armature's motion path. |
 | `Clear Motion Path` | Button | Clears the selected object's or armature's calculated motion path from the viewport. |
 # Instructions
+
+<p align="center">
+  <img src="BMP Lite.gif">
+</p>
+
 ### 1. Install the add-on
 Download the add-on `.py` file.
 In Blender, go to:
