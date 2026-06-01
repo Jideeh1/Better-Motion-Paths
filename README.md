@@ -1,4 +1,4 @@
-# Better-Motion-Paths
+# Better-Motion-Paths [Blender 3.3+]
 A blender add-on that allows motion path adjustment inside the 3D viewport.
 <p align="center">
   <img src="Better Motion Paths.png">
