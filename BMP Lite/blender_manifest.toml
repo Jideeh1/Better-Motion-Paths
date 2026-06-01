@@ -1,0 +1,26 @@
+schema_version = "1.0.0"
+
+id = "editable_motion_path_curve"
+version = "1.4.0"
+name = "Editable Motion Path Curve"
+tagline = "Edit motion paths as Bezier curves in 3D view"
+maintainer = "Your Name <your.email@example.com>"
+type = "add-on"
+
+# Optional links
+# website = "https://github.com/YOUR_USERNAME/YOUR_REPOSITORY"
+
+# Blender extension tags
+# See Blender's allowed extension tags before publishing.
+tags = ["Animation", "3D View"]
+
+# The Blender Extensions platform uses the extension system introduced for Blender 4.2+.
+# The add-on code itself can still keep bl_info blender = (3, 3, 0) if you also distribute it as a legacy .py add-on.
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+# Optional but recommended if publishing publicly.
+# copyright = [
+#   "2026 Your Name",
+# ]
