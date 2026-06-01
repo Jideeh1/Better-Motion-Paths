@@ -45,7 +45,7 @@ This lets you create a visible Bezier curve from an object's motion path that is
 </p>
 
 ### 1. Install the add-on
-Download the add-on `.py` file.
+Download the add-on `.zip` file.
 In Blender, go to:
 `Edit > Preferences > Add-ons > Install`
 Select the add-on file, then enable it in the add-ons list.
