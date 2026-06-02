@@ -1,4 +1,6 @@
 # Better-Motion-Paths [Blender 3.3+]
+![views](https://img.shields.io/badge/views-tracked-blue)
+
 A blender add-on that allows motion path adjustment inside the 3D viewport.
 <p align="center">
   <img src="Better Motion Paths.png">
