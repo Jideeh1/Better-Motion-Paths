@@ -9,6 +9,6 @@ type = "add-on"
 
 tags = ["Animation", "3D View"]
 
-blender_version_min = "3.3.0"
+blender_version_min = "4.2.0"
 
 license = ["SPDX:GPL-3.0-or-later"]

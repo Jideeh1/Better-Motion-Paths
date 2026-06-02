@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Better Motion Path",
     "author": "Jideeh",
-    "version": (1, 4, 0),
+    "version": (1, 4, 5),
     "blender": (3, 3, 0),
     "location": "View3D > Sidebar > Animation > Motion Path",
     "description": "Blender 3.3+ add-on: edit an object's location motion path as a thick colored Bezier curve, bake fresh keyframes, and manage motion paths.",
@@ -9,10 +9,12 @@ bl_info = {
 }
 
 import bpy
+import json
 from mathutils import Vector
 
 CURVE_PROP_NAME = "_motion_path_edit_curve_for"
 CURVE_FRAME_PROP = "_motion_path_edit_curve_frames"
+ORIGINAL_PATH_PROP = "_motion_path_edit_original_path_json"
 MATERIAL_NAME = "MPE Helper Curve Material"
 
 
@@ -79,16 +81,98 @@ def find_existing_curve_for(obj):
     return None
 
 
+def stored_frames_from_curve(curve_obj):
+    if not curve_obj:
+        return []
+    stored = curve_obj.get(CURVE_FRAME_PROP, "")
+    try:
+        return sorted({int(x) for x in stored.split(',') if x.strip()})
+    except Exception:
+        return []
+
+
 def frames_from_curve_or_object(curve_obj, target_obj):
-    if curve_obj:
-        stored = curve_obj.get(CURVE_FRAME_PROP, "")
-        try:
-            frames = sorted({int(x) for x in stored.split(',') if x.strip()})
-            if len(frames) >= 2:
-                return frames
-        except Exception:
-            pass
-    return get_location_key_frames(target_obj)
+    """Return the frame range used for baking.
+
+    The target object's current location keyframes are authoritative. This means
+    retiming is respected: if the helper curve was created from frames 1-100 but
+    the target keyframe is later moved to frame 200, baking uses 1-200.
+    The curve's stored frame list is only a fallback.
+    """
+    current = get_location_key_frames(target_obj)
+    if len(current) >= 2:
+        return current
+
+    stored = stored_frames_from_curve(curve_obj)
+    if len(stored) >= 2:
+        return stored
+
+    return current
+
+
+def capture_original_location_path(obj):
+    """Capture the object's current keyed location values so baked paths can be reset later."""
+    frames = get_location_key_frames(obj)
+    data = []
+    for frame in frames:
+        loc = evaluate_location_at_frame(obj, frame)
+        data.append({
+            "frame": int(frame),
+            "location": [float(loc.x), float(loc.y), float(loc.z)],
+        })
+    return data
+
+
+def store_original_location_path(owner, data):
+    try:
+        owner[ORIGINAL_PATH_PROP] = json.dumps(data)
+    except Exception:
+        pass
+
+
+def load_original_location_path(owner):
+    if owner is None or ORIGINAL_PATH_PROP not in owner:
+        return []
+    try:
+        raw = owner.get(ORIGINAL_PATH_PROP, "[]")
+        data = json.loads(raw)
+        result = []
+        for item in data:
+            frame = int(item.get("frame"))
+            loc = item.get("location")
+            if isinstance(loc, list) and len(loc) == 3:
+                result.append((frame, Vector((float(loc[0]), float(loc[1]), float(loc[2])))))
+        return sorted(result, key=lambda x: x[0])
+    except Exception:
+        return []
+
+
+def restore_original_location_path(context, obj):
+    """Restore location keyframes from the saved pre-bake path stored on the target object."""
+    saved = load_original_location_path(obj)
+    if len(saved) < 2:
+        return []
+
+    scene = context.scene
+    original_scene_frame = scene.frame_current
+    delete_location_fcurves(obj)
+
+    for frame, loc in saved:
+        scene.frame_set(frame)
+        obj.location = loc
+        obj.keyframe_insert(data_path="location", frame=frame)
+
+    set_key_interpolation(obj, scene.mpe_key_interpolation)
+    first_frame = min(frame for frame, _loc in saved)
+    last_frame = max(frame for frame, _loc in saved)
+    calculate_motion_path(context, obj, first_frame, last_frame)
+
+    if first_frame <= original_scene_frame <= last_frame:
+        scene.frame_set(original_scene_frame)
+    else:
+        scene.frame_set(first_frame)
+    context.view_layer.update()
+    return [frame for frame, _loc in saved]
 
 
 def get_or_create_curve_material(color):
@@ -114,6 +198,62 @@ def apply_curve_color(curve_obj, color):
     mat = get_or_create_curve_material(color)
     curve_obj.data.materials.clear()
     curve_obj.data.materials.append(mat)
+
+
+def update_curve_color(self, context):
+    """Automatically apply the chosen color to existing editable helper curves."""
+    try:
+        for obj in context.scene.objects:
+            if obj.type == 'CURVE' and CURVE_PROP_NAME in obj:
+                apply_curve_color(obj, context.scene.mpe_curve_color)
+    except Exception:
+        pass
+
+
+def object_has_motion_path(obj):
+    try:
+        return bool(obj and obj.motion_path)
+    except Exception:
+        return False
+
+
+def reset_curve_to_target_keyframes(curve_obj, target_obj, scene):
+    """Reset the editable helper curve back to the target object's current location keys."""
+    if curve_obj is None or target_obj is None:
+        return []
+
+    frames = get_location_key_frames(target_obj)
+    if len(frames) < 2:
+        return []
+
+    curve_data = curve_obj.data
+    curve_data.splines.clear()
+    curve_data.dimensions = '3D'
+    curve_data.resolution_u = 32
+    curve_data.bevel_depth = scene.mpe_curve_thickness
+    curve_data.bevel_resolution = 4
+    curve_data.twist_smooth = 8
+
+    spl = curve_data.splines.new('BEZIER')
+    spl.bezier_points.add(len(frames) - 1)
+
+    inv = curve_obj.matrix_world.inverted()
+    for bp, frame in zip(spl.bezier_points, frames):
+        loc = evaluate_location_at_frame(target_obj, frame)
+        world_pos = world_from_location_value(target_obj, loc)
+        bp.co = inv @ world_pos
+        bp.handle_left_type = scene.mpe_handle_mode
+        bp.handle_right_type = scene.mpe_handle_mode
+
+    curve_obj[CURVE_PROP_NAME] = target_obj.name
+    curve_obj[CURVE_FRAME_PROP] = ",".join(str(f) for f in frames)
+    if ORIGINAL_PATH_PROP not in curve_obj:
+        original_data = capture_original_location_path(target_obj)
+        store_original_location_path(curve_obj, original_data)
+    curve_obj.show_in_front = True
+    curve_obj.display_type = 'TEXTURED'
+    apply_curve_color(curve_obj, scene.mpe_curve_color)
+    return frames
 
 
 def sample_bezier_curve_world(curve_obj, samples_per_segment=64):
@@ -356,6 +496,7 @@ class MPE_OT_create_curve(bpy.types.Operator):
         context.collection.objects.link(curve_obj)
         curve_obj[CURVE_PROP_NAME] = obj.name
         curve_obj[CURVE_FRAME_PROP] = ",".join(str(f) for f in frames)
+        store_original_location_path(curve_obj, capture_original_location_path(obj))
         curve_obj.show_in_front = True
         curve_obj.display_type = 'TEXTURED'
         apply_curve_color(curve_obj, scene.mpe_curve_color)
@@ -392,7 +533,7 @@ class MPE_OT_apply_curve_color(bpy.types.Operator):
 class MPE_OT_bake_keys_to_curve(bpy.types.Operator):
     bl_idname = "mpe.bake_keys_to_curve"
     bl_label = "Bake Keyframes To Curve"
-    bl_description = "Bake fresh location keyframes to the edited curve, delete old location keys, delete the curve, and auto-calculate motion paths"
+    bl_description = "Bake fresh location keyframes to the edited curve using the target object's current keyframe range"
     bl_options = {'UNDO'}
 
     def execute(self, context):
@@ -412,7 +553,7 @@ class MPE_OT_bake_keys_to_curve(bpy.types.Operator):
 
         frames = frames_from_curve_or_object(curve_obj, target_obj)
         if len(frames) < 2:
-            self.report({'ERROR'}, "Could not determine the original keyframe range.")
+            self.report({'ERROR'}, "Could not determine the current keyframe range.")
             return {'CANCELLED'}
 
         points = sample_bezier_curve_world(curve_obj, scene.mpe_curve_accuracy)
@@ -450,6 +591,14 @@ class MPE_OT_bake_keys_to_curve(bpy.types.Operator):
 
         set_key_interpolation(target_obj, scene.mpe_key_interpolation)
 
+        # Keep a reset point on the target object after the helper curve is deleted.
+        original_path = load_original_location_path(curve_obj)
+        if original_path:
+            store_original_location_path(target_obj, [
+                {"frame": frame, "location": [float(loc.x), float(loc.y), float(loc.z)]}
+                for frame, loc in original_path
+            ])
+
         bpy.data.objects.remove(curve_obj, do_unlink=True)
 
         bpy.ops.object.select_all(action='DESELECT')
@@ -472,6 +621,134 @@ class MPE_OT_bake_keys_to_curve(bpy.types.Operator):
 
         return {'FINISHED'}
 
+
+
+class MPE_OT_remove_editable_motion_paths(bpy.types.Operator):
+    bl_idname = "mpe.remove_editable_motion_paths"
+    bl_label = "Remove Editable Motion Paths"
+    bl_description = "Delete generated editable helper curves without changing the target object's keyframes"
+    bl_options = {'UNDO'}
+
+    remove_all: bpy.props.BoolProperty(
+        name="Remove All",
+        default=False,
+        description="Remove all generated editable motion path curves in the scene instead of only the selected target's curve",
+    )
+
+    def execute(self, context):
+        ensure_object_mode()
+        selected = context.object
+        target = get_active_anim_object(context)
+        curves_to_remove = []
+
+        if self.remove_all:
+            curves_to_remove = [obj for obj in context.scene.objects if obj.type == 'CURVE' and CURVE_PROP_NAME in obj]
+        else:
+            if selected and selected.type == 'CURVE' and CURVE_PROP_NAME in selected:
+                curves_to_remove = [selected]
+            elif target:
+                found = find_existing_curve_for(target)
+                if found:
+                    curves_to_remove = [found]
+
+        if not curves_to_remove:
+            self.report({'ERROR'}, "No editable motion path curve found to remove.")
+            return {'CANCELLED'}
+
+        target_to_select = target if target and target.name in bpy.data.objects else None
+        if target_to_select is None and curves_to_remove:
+            target_to_select = bpy.data.objects.get(curves_to_remove[0].get(CURVE_PROP_NAME))
+
+        removed_count = 0
+        for curve_obj in curves_to_remove:
+            if curve_obj and curve_obj.name in bpy.data.objects:
+                bpy.data.objects.remove(curve_obj, do_unlink=True)
+                removed_count += 1
+
+        bpy.ops.object.select_all(action='DESELECT')
+        if target_to_select and target_to_select.name in bpy.data.objects:
+            target_to_select.select_set(True)
+            context.view_layer.objects.active = target_to_select
+        context.view_layer.update()
+
+        self.report({'INFO'}, f"Removed {removed_count} editable motion path curve(s).")
+        return {'FINISHED'}
+
+
+class MPE_OT_reset_motion_path(bpy.types.Operator):
+    bl_idname = "mpe.reset_motion_path"
+    bl_label = "Reset Motion Path"
+    bl_description = "Reset the editable helper curve, or restore baked keyframes to the saved original path after baking"
+    bl_options = {'UNDO'}
+
+    def execute(self, context):
+        ensure_object_mode()
+        scene = context.scene
+        selected = context.object
+
+        if selected and selected.type == 'CURVE' and CURVE_PROP_NAME in selected:
+            curve_obj = selected
+            target_obj = bpy.data.objects.get(curve_obj.get(CURVE_PROP_NAME))
+        else:
+            target_obj = get_active_anim_object(context)
+            curve_obj = find_existing_curve_for(target_obj)
+
+        if target_obj is not None and curve_obj is not None:
+            frames = reset_curve_to_target_keyframes(curve_obj, target_obj, scene)
+            if len(frames) < 2:
+                self.report({'ERROR'}, "Target object needs at least two current location keyframes to reset the edit curve.")
+                return {'CANCELLED'}
+            bpy.ops.object.select_all(action='DESELECT')
+            curve_obj.select_set(True)
+            context.view_layer.objects.active = curve_obj
+            context.view_layer.update()
+            self.report({'INFO'}, f"Editable motion path reset to current keys over frames {min(frames)}-{max(frames)}.")
+            return {'FINISHED'}
+
+        if target_obj is not None:
+            frames = restore_original_location_path(context, target_obj)
+            if len(frames) >= 2:
+                bpy.ops.object.select_all(action='DESELECT')
+                target_obj.select_set(True)
+                context.view_layer.objects.active = target_obj
+                context.view_layer.update()
+                self.report({'INFO'}, f"Baked motion path reset to saved original keys over frames {min(frames)}-{max(frames)}.")
+                return {'FINISHED'}
+
+        self.report({'ERROR'}, "No editable curve or saved baked reset data found. Create an editable motion path first, then bake it.")
+        return {'CANCELLED'}
+
+
+class MPE_OT_calculate_motion_path(bpy.types.Operator):
+    bl_idname = "mpe.calculate_motion_path"
+    bl_label = "Calculate Motion Path"
+    bl_description = "Calculate or recalculate the selected object's or armature's motion path over its current location-keyframe range"
+    bl_options = {'UNDO'}
+
+    def execute(self, context):
+        ensure_object_mode()
+        obj = get_active_anim_object(context)
+
+        if obj is None or obj.type == 'CURVE':
+            self.report({'ERROR'}, "No selected object or armature yet.")
+            return {'CANCELLED'}
+
+        frames = get_location_key_frames(obj)
+        if len(frames) < 2:
+            self.report({'ERROR'}, "Selected object or armature needs at least two location keyframes.")
+            return {'CANCELLED'}
+
+        first_frame = min(frames)
+        last_frame = max(frames)
+        was_recalc = object_has_motion_path(obj)
+        ok = calculate_motion_path(context, obj, first_frame, last_frame)
+        if ok:
+            verb = "recalculated" if was_recalc else "calculated"
+            self.report({'INFO'}, f"Motion path {verb} over frames {first_frame}-{last_frame}.")
+            return {'FINISHED'}
+
+        self.report({'WARNING'}, "Blender did not allow automatic motion-path calculation in this context.")
+        return {'CANCELLED'}
 
 class MPE_OT_recalculate_motion_path(bpy.types.Operator):
     bl_idname = "mpe.recalculate_motion_path"
@@ -542,10 +819,12 @@ class MPE_PT_panel(bpy.types.Panel):
 
         layout.separator()
         layout.label(text="Create Curve")
+        layout.prop(scene, "mpe_handle_mode")
+        row = layout.row(align=True)
+        row.operator(MPE_OT_reset_motion_path.bl_idname, icon='FILE_REFRESH')
+        row.operator(MPE_OT_remove_editable_motion_paths.bl_idname, icon='TRASH')
         layout.prop(scene, "mpe_curve_thickness")
         layout.prop(scene, "mpe_curve_color")
-        layout.operator(MPE_OT_apply_curve_color.bl_idname, icon='COLOR')
-        layout.prop(scene, "mpe_handle_mode")
         layout.operator(MPE_OT_create_curve.bl_idname, icon='CURVE_BEZCURVE')
 
         layout.separator()
@@ -559,7 +838,8 @@ class MPE_PT_panel(bpy.types.Panel):
         layout.separator()
         layout.label(text="Motion Path")
         row = layout.row(align=True)
-        row.operator(MPE_OT_recalculate_motion_path.bl_idname, icon='IPO_BEZIER')
+        motion_label = "Recalculate Motion Path" if object_has_motion_path(target) else "Calculate Motion Path"
+        row.operator(MPE_OT_calculate_motion_path.bl_idname, text=motion_label, icon='IPO_BEZIER')
         row.operator(MPE_OT_clear_motion_path.bl_idname, icon='X')
 
         layout.separator()
@@ -567,13 +847,18 @@ class MPE_PT_panel(bpy.types.Panel):
         box.label(text="How to curve a motion path:")
         box.label(text="1. Create editable motion path")
         box.label(text="2. Adjust the bezier curve in Edit Mode")
-        box.label(text="3. Adjust the value of Bake every N Frames.")
-        box.label(text="(Bake evert N Frames sets the space between every keyframes.)")
+        box.label(text="3. Reset works before and after baking")
+        box.label(text="4. Retiming is supported: move target keyframes")
+        box.label(text="5. Bake Keyframes To Curve")
+        box.label(text="Remove deletes helper curves only.")
 
 classes = (
     MPE_OT_create_curve,
     MPE_OT_apply_curve_color,
     MPE_OT_bake_keys_to_curve,
+    MPE_OT_remove_editable_motion_paths,
+    MPE_OT_reset_motion_path,
+    MPE_OT_calculate_motion_path,
     MPE_OT_recalculate_motion_path,
     MPE_OT_clear_motion_path,
     MPE_PT_panel,
@@ -596,6 +881,7 @@ def register():
         max=1.0,
         default=(1.0, 0.25, 0.05, 1.0),
         description="Color of the generated helper Bezier curve",
+        update=update_curve_color,
     )
     bpy.types.Scene.mpe_handle_mode = bpy.props.EnumProperty(
         name="Handle Mode",
@@ -611,7 +897,7 @@ def register():
         default=1,
         min=1,
         max=100,
-        description="Bake one new key every N frames over the original range",
+        description="Bake one new key every N frames over the target object's current keyframe range",
     )
     bpy.types.Scene.mpe_curve_accuracy = bpy.props.IntProperty(
         name="Curve Accuracy",
