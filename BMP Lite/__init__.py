@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Better Motion Path",
     "author": "Jideeh",
-    "version": (1, 4, 5),
+    "version": (1, 5, 5),
     "blender": (3, 3, 0),
     "location": "View3D > Sidebar > Animation > Motion Path",
     "description": "Blender 3.3+ add-on: edit an object's location motion path as a thick colored Bezier curve, bake fresh keyframes, and manage motion paths.",
@@ -11,15 +11,31 @@ bl_info = {
 import bpy
 import json
 from mathutils import Vector
+from bpy.app.handlers import persistent
+
+try:
+    from bpy_extras import anim_utils
+except Exception:
+    anim_utils = None
 
 CURVE_PROP_NAME = "_motion_path_edit_curve_for"
 CURVE_FRAME_PROP = "_motion_path_edit_curve_frames"
 ORIGINAL_PATH_PROP = "_motion_path_edit_original_path_json"
 MATERIAL_NAME = "MPE Helper Curve Material"
+HANDLE_PROP_NAME = "_motion_path_edit_handle_for"
+HANDLE_INDEX_PROP = "_motion_path_edit_handle_index"
+HANDLE_ROLE_PROP = "_motion_path_edit_handle_role"
+HANDLE_LINE_PROP_NAME = "_motion_path_edit_handle_line_for"
+HANDLE_LINE_INDEX_PROP = "_motion_path_edit_handle_line_index"
+HANDLE_LINE_ROLE_PROP = "_motion_path_edit_handle_line_role"
+HANDLE_SYNC_BUSY = False
+AUTO_BAKE_BUSY = False
+AUTO_BAKE_PENDING = set()
+AUTO_BAKE_TIMER_ACTIVE = False
+AUTO_BAKE_STATE = {}
 
 
 def ensure_object_mode():
-    """Commit edit-mode curve edits before reading spline data."""
     try:
         if bpy.ops.object.mode_set.poll():
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -36,13 +52,124 @@ def get_active_anim_object(context):
     return obj
 
 
-def get_location_fcurves(obj):
+def get_action_slot(obj):
+    ad = getattr(obj, "animation_data", None)
+    if ad is None:
+        return None
+    slot = getattr(ad, "action_slot", None)
+    if slot is not None:
+        return slot
+    action = getattr(ad, "action", None)
+    slots = getattr(action, "slots", None)
+    if slots:
+        try:
+            return slots[0]
+        except Exception:
+            return None
+    return None
+
+
+def _channelbag_from_anim_utils(action, slot, ensure=False):
+    if anim_utils is None or action is None or slot is None:
+        return None
+
+    helper_names = (
+        "action_get_channelbag_for_slot",
+        "action_ensure_channelbag_for_slot",
+    )
+
+    for helper_name in helper_names:
+        helper = getattr(anim_utils, helper_name, None)
+        if helper is None:
+            continue
+        try:
+            if helper_name == "action_ensure_channelbag_for_slot" or ensure:
+                return helper(action, slot)
+            return helper(action, slot)
+        except Exception:
+            continue
+
+    return None
+
+
+def _channelbag_from_layers(action, slot, ensure=False):
+    if action is None or slot is None:
+        return None
+
+    layers = getattr(action, "layers", None)
+    if layers is None:
+        return None
+
+    if ensure:
+        try:
+            if len(layers) == 0:
+                layer = layers.new("Layer")
+            else:
+                layer = layers[0]
+            if len(layer.strips) == 0:
+                layer.strips.new(type='KEYFRAME')
+        except Exception:
+            pass
+
+    for layer in layers:
+        strips = getattr(layer, "strips", [])
+        for strip in strips:
+            channelbag_method = getattr(strip, "channelbag", None)
+            if channelbag_method:
+                try:
+                    return channelbag_method(slot, ensure=ensure)
+                except TypeError:
+                    try:
+                        return channelbag_method(slot)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            for channelbag in getattr(strip, "channelbags", []):
+                try:
+                    if getattr(channelbag, "slot", None) == slot:
+                        return channelbag
+                except Exception:
+                    pass
+                try:
+                    if getattr(channelbag, "slot_handle", None) == getattr(slot, "handle", None):
+                        return channelbag
+                except Exception:
+                    pass
+
+    return None
+
+
+def get_fcurve_collections(obj, ensure=False):
     if not obj or not obj.animation_data or not obj.animation_data.action:
         return []
-    return [
-        fc for fc in obj.animation_data.action.fcurves
-        if fc.data_path == "location" and fc.array_index in {0, 1, 2}
-    ]
+
+    action = obj.animation_data.action
+
+    legacy_fcurves = getattr(action, "fcurves", None)
+    if legacy_fcurves is not None:
+        return [legacy_fcurves]
+
+    slot = get_action_slot(obj)
+    channelbag = _channelbag_from_anim_utils(action, slot, ensure=ensure)
+    if channelbag is None:
+        channelbag = _channelbag_from_layers(action, slot, ensure=ensure)
+
+    if channelbag is not None and getattr(channelbag, "fcurves", None) is not None:
+        return [channelbag.fcurves]
+
+    return []
+
+
+def get_location_fcurves(obj):
+    fcurves = []
+    for collection in get_fcurve_collections(obj, ensure=False):
+        fcurves.extend([
+            fc for fc in collection
+            if fc.data_path == "location" and fc.array_index in {0, 1, 2}
+        ])
+    return fcurves
 
 
 def get_location_key_frames(obj):
@@ -51,6 +178,18 @@ def get_location_key_frames(obj):
         for fc in get_location_fcurves(obj)
         for kp in fc.keyframe_points
     })
+def get_editable_control_frames(frames, handle_count):
+    frames = sorted({int(frame) for frame in frames})
+    if len(frames) <= 2:
+        return frames
+    count = max(2, min(int(handle_count), len(frames)))
+    if count >= len(frames):
+        return frames
+    indexes = sorted({int(round(i * (len(frames) - 1) / float(count - 1))) for i in range(count)})
+    indexes[0] = 0
+    indexes[-1] = len(frames) - 1
+    return [frames[index] for index in indexes]
+
 
 
 def evaluate_location_at_frame(obj, frame):
@@ -92,13 +231,6 @@ def stored_frames_from_curve(curve_obj):
 
 
 def frames_from_curve_or_object(curve_obj, target_obj):
-    """Return the frame range used for baking.
-
-    The target object's current location keyframes are authoritative. This means
-    retiming is respected: if the helper curve was created from frames 1-100 but
-    the target keyframe is later moved to frame 200, baking uses 1-200.
-    The curve's stored frame list is only a fallback.
-    """
     current = get_location_key_frames(target_obj)
     if len(current) >= 2:
         return current
@@ -111,7 +243,6 @@ def frames_from_curve_or_object(curve_obj, target_obj):
 
 
 def capture_original_location_path(obj):
-    """Capture the object's current keyed location values so baked paths can be reset later."""
     frames = get_location_key_frames(obj)
     data = []
     for frame in frames:
@@ -148,7 +279,6 @@ def load_original_location_path(owner):
 
 
 def restore_original_location_path(context, obj):
-    """Restore location keyframes from the saved pre-bake path stored on the target object."""
     saved = load_original_location_path(obj)
     if len(saved) < 2:
         return []
@@ -201,7 +331,6 @@ def apply_curve_color(curve_obj, color):
 
 
 def update_curve_color(self, context):
-    """Automatically apply the chosen color to existing editable helper curves."""
     try:
         for obj in context.scene.objects:
             if obj.type == 'CURVE' and CURVE_PROP_NAME in obj:
@@ -218,7 +347,6 @@ def object_has_motion_path(obj):
 
 
 def reset_curve_to_target_keyframes(curve_obj, target_obj, scene):
-    """Reset the editable helper curve back to the target object's current location keys."""
     if curve_obj is None or target_obj is None:
         return []
 
@@ -234,11 +362,12 @@ def reset_curve_to_target_keyframes(curve_obj, target_obj, scene):
     curve_data.bevel_resolution = 4
     curve_data.twist_smooth = 8
 
+    control_frames = get_editable_control_frames(frames, scene.mpe_control_handle_count)
     spl = curve_data.splines.new('BEZIER')
-    spl.bezier_points.add(len(frames) - 1)
+    spl.bezier_points.add(len(control_frames) - 1)
 
     inv = curve_obj.matrix_world.inverted()
-    for bp, frame in zip(spl.bezier_points, frames):
+    for bp, frame in zip(spl.bezier_points, control_frames):
         loc = evaluate_location_at_frame(target_obj, frame)
         world_pos = world_from_location_value(target_obj, loc)
         bp.co = inv @ world_pos
@@ -257,7 +386,6 @@ def reset_curve_to_target_keyframes(curve_obj, target_obj, scene):
 
 
 def sample_bezier_curve_world(curve_obj, samples_per_segment=64):
-    """Sample edited Bezier splines in world space."""
     points = []
     mw = curve_obj.matrix_world.copy()
 
@@ -323,10 +451,79 @@ def point_at_distance(points, lengths, distance):
 def delete_location_fcurves(obj):
     if not obj.animation_data or not obj.animation_data.action:
         return
-    action = obj.animation_data.action
-    for fc in list(action.fcurves):
-        if fc.data_path == "location" and fc.array_index in {0, 1, 2}:
-            action.fcurves.remove(fc)
+    for fcurve_collection in get_fcurve_collections(obj, ensure=False):
+        for fc in list(fcurve_collection):
+            if fc.data_path == "location" and fc.array_index in {0, 1, 2}:
+                try:
+                    fcurve_collection.remove(fc)
+                except Exception:
+                    pass
+
+
+def capture_location_key_settings(obj):
+    settings = {}
+    for fc in get_location_fcurves(obj):
+        axis_settings = {}
+        for kp in fc.keyframe_points:
+            frame = int(round(kp.co.x))
+            axis_settings[frame] = {
+                "interpolation": getattr(kp, "interpolation", 'BEZIER'),
+                "easing": getattr(kp, "easing", 'AUTO'),
+                "handle_left_type": getattr(kp, "handle_left_type", 'AUTO'),
+                "handle_right_type": getattr(kp, "handle_right_type", 'AUTO'),
+                "amplitude": getattr(kp, "amplitude", 0.0),
+                "back": getattr(kp, "back", 0.0),
+                "period": getattr(kp, "period", 0.0),
+            }
+        settings[fc.array_index] = axis_settings
+    return settings
+
+
+def apply_location_key_settings(obj, settings, fallback_interpolation='LINEAR'):
+    for fc in get_location_fcurves(obj):
+        axis_settings = settings.get(fc.array_index, {}) if settings else {}
+        for kp in fc.keyframe_points:
+            frame = int(round(kp.co.x))
+            data = axis_settings.get(frame)
+            if data:
+                try:
+                    kp.interpolation = data.get("interpolation", fallback_interpolation)
+                except Exception:
+                    pass
+                for attr in ("easing", "handle_left_type", "handle_right_type", "amplitude", "back", "period"):
+                    if attr in data:
+                        try:
+                            setattr(kp, attr, data[attr])
+                        except Exception:
+                            pass
+            else:
+                try:
+                    kp.interpolation = fallback_interpolation
+                except Exception:
+                    pass
+        fc.update()
+
+
+def build_original_motion_progress_ratios(obj, bake_frames):
+    if not bake_frames:
+        return {}
+
+    frames = sorted({int(f) for f in bake_frames})
+    original_positions = [evaluate_location_at_frame(obj, frame) for frame in frames]
+
+    distances = [0.0]
+    total = 0.0
+    for prev, current in zip(original_positions, original_positions[1:]):
+        total += (current - prev).length
+        distances.append(total)
+
+    if total <= 0.000001:
+        first = frames[0]
+        last = frames[-1]
+        span = max(1.0, float(last - first))
+        return {frame: (float(frame) - first) / span for frame in frames}
+
+    return {frame: distance / total for frame, distance in zip(frames, distances)}
 
 
 def set_key_interpolation(obj, interpolation):
@@ -337,7 +534,6 @@ def set_key_interpolation(obj, interpolation):
 
 
 def find_view3d_override(context):
-    """Return a 3D View context override when possible, useful for motion path operators in 3.3+."""
     window = context.window
     screen = context.screen
     if not window or not screen:
@@ -369,7 +565,6 @@ def find_view3d_override(context):
 
 
 def clear_motion_path(context, obj):
-    """Clear selected object's motion path with context fallbacks for Blender 3.3+."""
     ensure_object_mode()
     bpy.ops.object.select_all(action='DESELECT')
     obj.select_set(True)
@@ -400,12 +595,6 @@ def clear_motion_path(context, obj):
 
 
 def calculate_motion_path(context, obj, first_frame, last_frame):
-    """Automatically recalculate object motion paths after baking.
-
-    Blender's motion-path operator API has changed a little across versions, so this
-    function tries several compatible calls. If one works, it returns True. If all
-    fail, the baked keyframes are still valid and the user gets a warning.
-    """
     scene = context.scene
 
     ensure_object_mode()
@@ -452,6 +641,395 @@ def calculate_motion_path(context, obj, first_frame, last_frame):
 
 
 
+
+def make_material(name, color):
+    mat = bpy.data.materials.get(name)
+    if mat is None:
+        mat = bpy.data.materials.new(name)
+    mat.diffuse_color = color
+    return mat
+
+
+def is_motion_path_handle(obj):
+    return bool(obj and HANDLE_PROP_NAME in obj and HANDLE_INDEX_PROP in obj and HANDLE_ROLE_PROP in obj)
+
+
+def is_motion_path_handle_line(obj):
+    return bool(obj and HANDLE_LINE_PROP_NAME in obj and HANDLE_LINE_INDEX_PROP in obj and HANDLE_LINE_ROLE_PROP in obj)
+
+
+def find_handles_for_curve(curve_obj):
+    if curve_obj is None:
+        return []
+    return [obj for obj in bpy.context.scene.objects if is_motion_path_handle(obj) and obj.get(HANDLE_PROP_NAME) == curve_obj.name]
+
+
+def find_handle_lines_for_curve(curve_obj):
+    if curve_obj is None:
+        return []
+    return [obj for obj in bpy.context.scene.objects if is_motion_path_handle_line(obj) and obj.get(HANDLE_LINE_PROP_NAME) == curve_obj.name]
+
+
+def remove_handles_for_curve(curve_obj):
+    for obj in list(find_handles_for_curve(curve_obj)) + list(find_handle_lines_for_curve(curve_obj)):
+        if obj.name in bpy.data.objects:
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+
+def make_handle_object(context, curve_obj, index, role, world_pos, size):
+    mesh = bpy.data.meshes.new(curve_obj.name + " " + role + " Mesh " + str(index))
+    radius = size if role == 'Point' else size * 0.55
+    verts = [(-radius, 0, 0), (radius, 0, 0), (0, -radius, 0), (0, radius, 0), (0, 0, -radius), (0, 0, radius)]
+    faces = [(0, 2, 4), (2, 1, 4), (1, 3, 4), (3, 0, 4), (2, 0, 5), (1, 2, 5), (3, 1, 5), (0, 3, 5)]
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    obj = bpy.data.objects.new(curve_obj.name + " " + role + " " + str(index), mesh)
+    obj.location = world_pos
+    obj.show_in_front = True
+    obj[HANDLE_PROP_NAME] = curve_obj.name
+    obj[HANDLE_INDEX_PROP] = int(index)
+    obj[HANDLE_ROLE_PROP] = role
+    if role == 'Point':
+        color = (1.0, 0.85, 0.05, 1.0)
+    elif role == 'Left':
+        color = (0.1, 0.45, 1.0, 1.0)
+    else:
+        color = (0.1, 1.0, 0.35, 1.0)
+    obj.color = color
+    obj.data.materials.append(make_material("BMP " + role + " Handle", color))
+    context.collection.objects.link(obj)
+    return obj
+
+
+def make_handle_line(context, curve_obj, index, role, start, end, size):
+    data = bpy.data.curves.new(curve_obj.name + " " + role + " Line " + str(index), type='CURVE')
+    data.dimensions = '3D'
+    data.resolution_u = 1
+    data.bevel_depth = max(0.005, size * 0.08)
+    data.bevel_resolution = 1
+    spl = data.splines.new('POLY')
+    spl.points.add(1)
+    spl.points[0].co = (start.x, start.y, start.z, 1.0)
+    spl.points[1].co = (end.x, end.y, end.z, 1.0)
+    obj = bpy.data.objects.new(curve_obj.name + " " + role + " Line " + str(index), data)
+    obj.show_in_front = True
+    obj.hide_select = True
+    obj[HANDLE_LINE_PROP_NAME] = curve_obj.name
+    obj[HANDLE_LINE_INDEX_PROP] = int(index)
+    obj[HANDLE_LINE_ROLE_PROP] = role
+    color = (0.35, 0.65, 1.0, 1.0) if role == 'Left' else (0.35, 1.0, 0.55, 1.0)
+    obj.color = color
+    obj.data.materials.append(make_material("BMP " + role + " Handle Line", color))
+    context.collection.objects.link(obj)
+    return obj
+
+
+def update_handle_lines(curve_obj):
+    handles = find_handles_for_curve(curve_obj)
+    lines = find_handle_lines_for_curve(curve_obj)
+    handle_by_key = {}
+    line_by_key = {}
+    for obj in handles:
+        handle_by_key[(int(obj.get(HANDLE_INDEX_PROP)), obj.get(HANDLE_ROLE_PROP))] = obj
+    for obj in lines:
+        line_by_key[(int(obj.get(HANDLE_LINE_INDEX_PROP)), obj.get(HANDLE_LINE_ROLE_PROP))] = obj
+    for key, line in line_by_key.items():
+        index, role = key
+        point = handle_by_key.get((index, 'Point'))
+        handle = handle_by_key.get((index, role))
+        if not point or not handle:
+            continue
+        spl = line.data.splines[0]
+        start = point.matrix_world.translation
+        end = handle.matrix_world.translation
+        spl.points[0].co = (start.x, start.y, start.z, 1.0)
+        spl.points[1].co = (end.x, end.y, end.z, 1.0)
+        line.data.update_tag()
+
+
+def make_initial_free_handles(curve_obj):
+    for spl in curve_obj.data.splines:
+        if spl.type != 'BEZIER':
+            continue
+        count = len(spl.bezier_points)
+        for index, bp in enumerate(spl.bezier_points):
+            previous_bp = spl.bezier_points[index - 1] if index > 0 else None
+            next_bp = spl.bezier_points[index + 1] if index < count - 1 else None
+            if previous_bp and next_bp:
+                direction = next_bp.co - previous_bp.co
+                length = min((bp.co - previous_bp.co).length, (next_bp.co - bp.co).length) / 3.0
+            elif next_bp:
+                direction = next_bp.co - bp.co
+                length = direction.length / 3.0
+            elif previous_bp:
+                direction = bp.co - previous_bp.co
+                length = direction.length / 3.0
+            else:
+                direction = Vector((1.0, 0.0, 0.0))
+                length = 1.0
+            if direction.length <= 0.000001:
+                direction = Vector((1.0, 0.0, 0.0))
+            direction.normalize()
+            bp.handle_left_type = 'FREE'
+            bp.handle_right_type = 'FREE'
+            bp.handle_left = bp.co - direction * length
+            bp.handle_right = bp.co + direction * length
+
+
+def create_object_mode_handles(context, curve_obj):
+    remove_handles_for_curve(curve_obj)
+    make_initial_free_handles(curve_obj)
+    handles = []
+    size = max(0.08, float(context.scene.mpe_curve_thickness) * 3.0)
+    mw = curve_obj.matrix_world
+    for spl in curve_obj.data.splines:
+        if spl.type != 'BEZIER':
+            continue
+        for index, bp in enumerate(spl.bezier_points):
+            point = make_handle_object(context, curve_obj, index, 'Point', mw @ bp.co, size)
+            left = make_handle_object(context, curve_obj, index, 'Left', mw @ bp.handle_left, size)
+            right = make_handle_object(context, curve_obj, index, 'Right', mw @ bp.handle_right, size)
+            make_handle_line(context, curve_obj, index, 'Left', point.location, left.location, size)
+            make_handle_line(context, curve_obj, index, 'Right', point.location, right.location, size)
+            handles.extend([point, left, right])
+    bpy.ops.object.select_all(action='DESELECT')
+    for obj in handles:
+        obj.select_set(True)
+    if handles:
+        context.view_layer.objects.active = handles[0]
+    update_handle_lines(curve_obj)
+    return handles
+
+
+def sync_curve_from_object_mode_handles(curve_obj):
+    if curve_obj is None or curve_obj.name not in bpy.data.objects:
+        return False
+    handles = find_handles_for_curve(curve_obj)
+    if not handles:
+        return False
+    by_key = {}
+    for obj in handles:
+        by_key[(int(obj.get(HANDLE_INDEX_PROP)), obj.get(HANDLE_ROLE_PROP))] = obj
+    inv = curve_obj.matrix_world.inverted()
+    changed = False
+    for spl in curve_obj.data.splines:
+        if spl.type != 'BEZIER':
+            continue
+        for index, bp in enumerate(spl.bezier_points):
+            point = by_key.get((index, 'Point'))
+            left = by_key.get((index, 'Left'))
+            right = by_key.get((index, 'Right'))
+            if point:
+                bp.co = inv @ point.matrix_world.translation
+                changed = True
+            if left:
+                bp.handle_left = inv @ left.matrix_world.translation
+                bp.handle_left_type = 'FREE'
+                changed = True
+            if right:
+                bp.handle_right = inv @ right.matrix_world.translation
+                bp.handle_right_type = 'FREE'
+                changed = True
+    if changed:
+        curve_obj.data.update_tag()
+        update_handle_lines(curve_obj)
+    return changed
+
+
+@persistent
+def motion_path_handle_sync_handler(scene, depsgraph):
+    global HANDLE_SYNC_BUSY
+    if HANDLE_SYNC_BUSY:
+        return
+    curves = set()
+    for update in depsgraph.updates:
+        item = update.id
+        if isinstance(item, bpy.types.Object) and is_motion_path_handle(item):
+            curve_obj = bpy.data.objects.get(item.get(HANDLE_PROP_NAME))
+            if curve_obj:
+                curves.add(curve_obj)
+                if getattr(scene, "mpe_auto_bake", False) and not AUTO_BAKE_BUSY:
+                    queue_auto_bake_curve(curve_obj)
+    if not curves:
+        return
+    HANDLE_SYNC_BUSY = True
+    try:
+        for curve_obj in curves:
+            sync_curve_from_object_mode_handles(curve_obj)
+    finally:
+        HANDLE_SYNC_BUSY = False
+AUTO_BAKE_BUSY = False
+AUTO_BAKE_PENDING = set()
+AUTO_BAKE_TIMER_ACTIVE = False
+AUTO_BAKE_STATE = {}
+
+
+def editable_curve_signature(curve_obj):
+    if curve_obj is None or curve_obj.name not in bpy.data.objects:
+        return None
+    sync_curve_from_object_mode_handles(curve_obj)
+    data = []
+    for spl in curve_obj.data.splines:
+        if spl.type != 'BEZIER':
+            continue
+        points = []
+        for bp in spl.bezier_points:
+            points.append((round(bp.co.x, 5), round(bp.co.y, 5), round(bp.co.z, 5), round(bp.handle_left.x, 5), round(bp.handle_left.y, 5), round(bp.handle_left.z, 5), round(bp.handle_right.x, 5), round(bp.handle_right.y, 5), round(bp.handle_right.z, 5)))
+        data.append(tuple(points))
+    return tuple(data)
+
+
+def bake_editable_curve(context, curve_obj, target_obj, keep_editable):
+    scene = context.scene
+    if target_obj is None or curve_obj is None:
+        return False, "Select the generated edit curve, or select the target object while its edit curve exists."
+    frames = frames_from_curve_or_object(curve_obj, target_obj)
+    if len(frames) < 2:
+        return False, "Could not determine the current keyframe range."
+    sync_curve_from_object_mode_handles(curve_obj)
+    points = sample_bezier_curve_world(curve_obj, scene.mpe_curve_accuracy)
+    if len(points) < 2:
+        return False, "The edit curve has no usable Bezier segments."
+    lengths, total_len = cumulative_lengths(points)
+    if total_len <= 0.000001:
+        return False, "The edit curve has no measurable length."
+    first_frame = min(frames)
+    last_frame = max(frames)
+    step = max(1, int(scene.mpe_bake_every_n_frames))
+    bake_frames = list(range(first_frame, last_frame + 1, step))
+    if bake_frames[-1] != last_frame:
+        bake_frames.append(last_frame)
+    progress_by_frame = build_original_motion_progress_ratios(target_obj, bake_frames)
+    baked = []
+    for frame in bake_frames:
+        ratio = progress_by_frame.get(frame, 0.0)
+        world_pos = point_at_distance(points, lengths, total_len * ratio)
+        baked.append((frame, location_value_from_world(target_obj, world_pos)))
+    original_scene_frame = scene.frame_current
+    original_key_settings = capture_location_key_settings(target_obj)
+    original_selected = list(context.selected_objects)
+    original_active = context.view_layer.objects.active
+    delete_location_fcurves(target_obj)
+    for frame, loc in baked:
+        scene.frame_set(frame)
+        target_obj.location = loc
+        target_obj.keyframe_insert(data_path="location", frame=frame)
+    apply_location_key_settings(target_obj, original_key_settings, scene.mpe_key_interpolation)
+    original_path = load_original_location_path(curve_obj)
+    if original_path:
+        store_original_location_path(target_obj, [
+            {"frame": frame, "location": [float(loc.x), float(loc.y), float(loc.z)]}
+            for frame, loc in original_path
+        ])
+    if keep_editable:
+        sync_curve_from_object_mode_handles(curve_obj)
+        update_handle_lines(curve_obj)
+    else:
+        remove_handles_for_curve(curve_obj)
+        bpy.data.objects.remove(curve_obj, do_unlink=True)
+    bpy.ops.object.select_all(action='DESELECT')
+    if keep_editable:
+        for obj in original_selected:
+            if obj and obj.name in bpy.data.objects:
+                obj.select_set(True)
+        if original_active and original_active.name in bpy.data.objects:
+            context.view_layer.objects.active = original_active
+    else:
+        target_obj.select_set(True)
+        context.view_layer.objects.active = target_obj
+    context.view_layer.update()
+    motion_path_ok = calculate_motion_path(context, target_obj, first_frame, last_frame) if not keep_editable else True
+    if first_frame <= original_scene_frame <= last_frame:
+        scene.frame_set(original_scene_frame)
+    else:
+        scene.frame_set(first_frame)
+    context.view_layer.update()
+    if not motion_path_ok:
+        return True, "Baked new keys, but Blender did not allow automatic motion-path calculation in this context."
+    return True, "Baked new keys to the edited curve."
+
+
+def queue_auto_bake_curve(curve_obj):
+    global AUTO_BAKE_TIMER_ACTIVE
+    if curve_obj is None or curve_obj.name not in bpy.data.objects:
+        return
+    signature = editable_curve_signature(curve_obj)
+    state = AUTO_BAKE_STATE.get(curve_obj.name, {})
+    state["pending_signature"] = signature
+    state["stable_count"] = 0
+    AUTO_BAKE_STATE[curve_obj.name] = state
+    AUTO_BAKE_PENDING.add(curve_obj.name)
+    if not AUTO_BAKE_TIMER_ACTIVE:
+        AUTO_BAKE_TIMER_ACTIVE = True
+        bpy.app.timers.register(run_auto_bake_timer, first_interval=0.25)
+
+
+def run_auto_bake_timer():
+    global AUTO_BAKE_BUSY, AUTO_BAKE_TIMER_ACTIVE
+    scene = bpy.context.scene
+    if scene is None or not getattr(scene, "mpe_auto_bake", False):
+        AUTO_BAKE_TIMER_ACTIVE = False
+        return None
+    if not AUTO_BAKE_PENDING:
+        AUTO_BAKE_TIMER_ACTIVE = False
+        return None
+    ready = []
+    for name in list(AUTO_BAKE_PENDING):
+        curve_obj = bpy.data.objects.get(name)
+        if curve_obj is None or curve_obj.type != 'CURVE' or CURVE_PROP_NAME not in curve_obj:
+            AUTO_BAKE_PENDING.discard(name)
+            AUTO_BAKE_STATE.pop(name, None)
+            continue
+        signature = editable_curve_signature(curve_obj)
+        state = AUTO_BAKE_STATE.get(name, {})
+        if signature == state.get("pending_signature"):
+            state["stable_count"] = state.get("stable_count", 0) + 1
+        else:
+            state["pending_signature"] = signature
+            state["stable_count"] = 0
+        AUTO_BAKE_STATE[name] = state
+        if state.get("stable_count", 0) >= 2 and signature != state.get("baked_signature"):
+            ready.append(name)
+    if not ready:
+        return 0.25
+    AUTO_BAKE_BUSY = True
+    try:
+        for name in ready:
+            curve_obj = bpy.data.objects.get(name)
+            if curve_obj is None or curve_obj.type != 'CURVE' or CURVE_PROP_NAME not in curve_obj:
+                AUTO_BAKE_PENDING.discard(name)
+                AUTO_BAKE_STATE.pop(name, None)
+                continue
+            target_obj = bpy.data.objects.get(curve_obj.get(CURVE_PROP_NAME))
+            if target_obj is None:
+                AUTO_BAKE_PENDING.discard(name)
+                AUTO_BAKE_STATE.pop(name, None)
+                continue
+            ok, message = bake_editable_curve(bpy.context, curve_obj, target_obj, True)
+            state = AUTO_BAKE_STATE.get(name, {})
+            if ok:
+                state["baked_signature"] = editable_curve_signature(curve_obj)
+                state["pending_signature"] = state["baked_signature"]
+                state["stable_count"] = 0
+                AUTO_BAKE_PENDING.discard(name)
+            AUTO_BAKE_STATE[name] = state
+    finally:
+        AUTO_BAKE_BUSY = False
+    if AUTO_BAKE_PENDING:
+        return 0.25
+    AUTO_BAKE_TIMER_ACTIVE = False
+    return None
+
+
+def update_auto_bake(self, context):
+    if getattr(context.scene, "mpe_auto_bake", False):
+        curve_obj = context.object if context.object and context.object.type == 'CURVE' and CURVE_PROP_NAME in context.object else None
+        if curve_obj is None:
+            target = get_active_anim_object(context)
+            curve_obj = find_existing_curve_for(target)
+        if curve_obj:
+            queue_auto_bake_curve(curve_obj)
+
 class MPE_OT_create_curve(bpy.types.Operator):
     bl_idname = "mpe.create_edit_curve"
     bl_label = "Create Editable Motion Path"
@@ -474,6 +1052,7 @@ class MPE_OT_create_curve(bpy.types.Operator):
 
         existing = find_existing_curve_for(obj)
         if existing:
+            remove_handles_for_curve(existing)
             bpy.data.objects.remove(existing, do_unlink=True)
 
         curve_data = bpy.data.curves.new(obj.name + " Motion Path Edit Curve", type='CURVE')
@@ -483,10 +1062,11 @@ class MPE_OT_create_curve(bpy.types.Operator):
         curve_data.bevel_resolution = 4
         curve_data.twist_smooth = 8
 
+        control_frames = get_editable_control_frames(frames, scene.mpe_control_handle_count)
         spl = curve_data.splines.new('BEZIER')
-        spl.bezier_points.add(len(frames) - 1)
+        spl.bezier_points.add(len(control_frames) - 1)
 
-        for bp, frame in zip(spl.bezier_points, frames):
+        for bp, frame in zip(spl.bezier_points, control_frames):
             loc = evaluate_location_at_frame(obj, frame)
             bp.co = world_from_location_value(obj, loc)
             bp.handle_left_type = scene.mpe_handle_mode
@@ -500,12 +1080,11 @@ class MPE_OT_create_curve(bpy.types.Operator):
         curve_obj.show_in_front = True
         curve_obj.display_type = 'TEXTURED'
         apply_curve_color(curve_obj, scene.mpe_curve_color)
-
+        clear_motion_path(context, obj)
+        create_object_mode_handles(context, curve_obj)
         obj.select_set(False)
-        curve_obj.select_set(True)
-        context.view_layer.objects.active = curve_obj
 
-        self.report({'INFO'}, "Editable colored curve created. Edit it, then press Bake Keyframes To Curve.")
+        self.report({'INFO'}, "Editable colored curve created. Move the object mode handles, then press Bake Keyframes To Curve.")
         return {'FINISHED'}
 
 
@@ -539,89 +1118,24 @@ class MPE_OT_bake_keys_to_curve(bpy.types.Operator):
     def execute(self, context):
         ensure_object_mode()
         scene = context.scene
-
         curve_obj = context.object if context.object and context.object.type == 'CURVE' else None
         if curve_obj and CURVE_PROP_NAME in curve_obj:
             target_obj = bpy.data.objects.get(curve_obj.get(CURVE_PROP_NAME))
         else:
             target_obj = get_active_anim_object(context)
             curve_obj = find_existing_curve_for(target_obj)
-
-        if target_obj is None or curve_obj is None:
-            self.report({'ERROR'}, "Select the generated edit curve, or select the target object while its edit curve exists.")
+        keep_editable = bool(getattr(scene, "mpe_auto_bake", False))
+        ok, message = bake_editable_curve(context, curve_obj, target_obj, keep_editable)
+        if not ok:
+            self.report({'ERROR'}, message)
             return {'CANCELLED'}
-
-        frames = frames_from_curve_or_object(curve_obj, target_obj)
-        if len(frames) < 2:
-            self.report({'ERROR'}, "Could not determine the current keyframe range.")
-            return {'CANCELLED'}
-
-        points = sample_bezier_curve_world(curve_obj, scene.mpe_curve_accuracy)
-        if len(points) < 2:
-            self.report({'ERROR'}, "The edit curve has no usable Bezier segments.")
-            return {'CANCELLED'}
-
-        lengths, total_len = cumulative_lengths(points)
-        if total_len <= 0.000001:
-            self.report({'ERROR'}, "The edit curve has no measurable length.")
-            return {'CANCELLED'}
-
-        first_frame = min(frames)
-        last_frame = max(frames)
-        frame_span = max(1.0, float(last_frame - first_frame))
-
-        step = max(1, int(scene.mpe_bake_every_n_frames))
-        bake_frames = list(range(first_frame, last_frame + 1, step))
-        if bake_frames[-1] != last_frame:
-            bake_frames.append(last_frame)
-
-        baked = []
-        for frame in bake_frames:
-            ratio = (float(frame) - first_frame) / frame_span
-            world_pos = point_at_distance(points, lengths, total_len * ratio)
-            baked.append((frame, location_value_from_world(target_obj, world_pos)))
-
-        original_scene_frame = scene.frame_current
-
-        delete_location_fcurves(target_obj)
-        for frame, loc in baked:
-            scene.frame_set(frame)
-            target_obj.location = loc
-            target_obj.keyframe_insert(data_path="location", frame=frame)
-
-        set_key_interpolation(target_obj, scene.mpe_key_interpolation)
-
-        # Keep a reset point on the target object after the helper curve is deleted.
-        original_path = load_original_location_path(curve_obj)
-        if original_path:
-            store_original_location_path(target_obj, [
-                {"frame": frame, "location": [float(loc.x), float(loc.y), float(loc.z)]}
-                for frame, loc in original_path
-            ])
-
-        bpy.data.objects.remove(curve_obj, do_unlink=True)
-
-        bpy.ops.object.select_all(action='DESELECT')
-        target_obj.select_set(True)
-        context.view_layer.objects.active = target_obj
-        context.view_layer.update()
-
-        motion_path_ok = calculate_motion_path(context, target_obj, first_frame, last_frame)
-
-        if first_frame <= original_scene_frame <= last_frame:
-            scene.frame_set(original_scene_frame)
+        if keep_editable:
+            self.report({'INFO'}, "Baked new keys and kept the editable curve.")
+        elif "did not allow" in message:
+            self.report({'WARNING'}, message)
         else:
-            scene.frame_set(first_frame)
-        context.view_layer.update()
-
-        if motion_path_ok:
             self.report({'INFO'}, "Baked new keys, deleted the curve, and recalculated motion paths.")
-        else:
-            self.report({'WARNING'}, "Baked new keys and deleted the curve, but Blender did not allow automatic motion-path calculation in this context.")
-
         return {'FINISHED'}
-
-
 
 class MPE_OT_remove_editable_motion_paths(bpy.types.Operator):
     bl_idname = "mpe.remove_editable_motion_paths"
@@ -662,6 +1176,7 @@ class MPE_OT_remove_editable_motion_paths(bpy.types.Operator):
         removed_count = 0
         for curve_obj in curves_to_remove:
             if curve_obj and curve_obj.name in bpy.data.objects:
+                remove_handles_for_curve(curve_obj)
                 bpy.data.objects.remove(curve_obj, do_unlink=True)
                 removed_count += 1
 
@@ -820,6 +1335,7 @@ class MPE_PT_panel(bpy.types.Panel):
         layout.separator()
         layout.label(text="Create Curve")
         layout.prop(scene, "mpe_handle_mode")
+        layout.prop(scene, "mpe_control_handle_count")
         row = layout.row(align=True)
         row.operator(MPE_OT_reset_motion_path.bl_idname, icon='FILE_REFRESH')
         row.operator(MPE_OT_remove_editable_motion_paths.bl_idname, icon='TRASH')
@@ -829,7 +1345,9 @@ class MPE_PT_panel(bpy.types.Panel):
 
         layout.separator()
         layout.label(text="Bake")
+        layout.prop(scene, "mpe_auto_bake")
         layout.prop(scene, "mpe_bake_every_n_frames")
+        layout.label(text="Timing: Preserve Original Ease", icon='TIME')
         layout.prop(scene, "mpe_curve_accuracy")
         layout.prop(scene, "mpe_key_interpolation")
         layout.prop(scene, "mpe_set_scene_range_for_motion_path")
@@ -846,7 +1364,7 @@ class MPE_PT_panel(bpy.types.Panel):
         box = layout.box()
         box.label(text="How to curve a motion path:")
         box.label(text="1. Create editable motion path")
-        box.label(text="2. Adjust the bezier curve in Edit Mode")
+        box.label(text="2. Move the object mode handles")
         box.label(text="3. Reset works before and after baking")
         box.label(text="4. Retiming is supported: move target keyframes")
         box.label(text="5. Bake Keyframes To Curve")
@@ -892,12 +1410,25 @@ def register():
         ],
         default='AUTO',
     )
+    bpy.types.Scene.mpe_auto_bake = bpy.props.BoolProperty(
+        name="Auto Bake",
+        default=False,
+        description="Bake keyframes after the editable curve handles are changed without deleting the curve",
+        update=update_auto_bake,
+    )
+    bpy.types.Scene.mpe_control_handle_count = bpy.props.IntProperty(
+        name="Control Handles",
+        default=4,
+        min=2,
+        max=100,
+        description="Number of editable object-mode control points created for the motion path",
+    )
     bpy.types.Scene.mpe_bake_every_n_frames = bpy.props.IntProperty(
         name="Bake Every N Frames",
         default=1,
         min=1,
         max=100,
-        description="Bake one new key every N frames over the target object's current keyframe range",
+        description="Bake one new key every N frames while preserving the original motion timing/ease",
     )
     bpy.types.Scene.mpe_curve_accuracy = bpy.props.IntProperty(
         name="Curve Accuracy",
@@ -923,15 +1454,21 @@ def register():
 
     for cls in classes:
         bpy.utils.register_class(cls)
+    if motion_path_handle_sync_handler not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(motion_path_handle_sync_handler)
 
 
 def unregister():
+    if motion_path_handle_sync_handler in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(motion_path_handle_sync_handler)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 
     del bpy.types.Scene.mpe_curve_thickness
     del bpy.types.Scene.mpe_curve_color
     del bpy.types.Scene.mpe_handle_mode
+    del bpy.types.Scene.mpe_auto_bake
+    del bpy.types.Scene.mpe_control_handle_count
     del bpy.types.Scene.mpe_bake_every_n_frames
     del bpy.types.Scene.mpe_curve_accuracy
     del bpy.types.Scene.mpe_key_interpolation
