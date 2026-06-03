@@ -1,0 +1,14 @@
+schema_version = "1.0.0"
+
+id = "motion_path"
+version = "1.5.5"
+name = "Motion Path Curve"
+tagline = "Edit motion paths as Bezier curves in 3D view"
+maintainer = "Jideeh <keonag@gmail.com>"
+type = "add-on"
+
+tags = ["Animation", "3D View"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
